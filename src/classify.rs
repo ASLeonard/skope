@@ -18,10 +18,44 @@ use std::time::Instant;
 
 // Index header constants and metadata
 const INDEX_MAGIC: &[u8; 4] = b"GRAT";
-const INDEX_FORMAT_VERSION: u8 = 1;
+const INDEX_FORMAT_VERSION: u8 = 2; // bumped from 1: per-entry bitmask is now variable width
 type ClassificationIndexHeader = ([u8; 4], u8, u8, u8, u8);
 
-/// Classification index mapping k-mers to group bitmasks (up to 64 groups)
+// --- GroupMask: variable-length group membership bitmask ---
+// Heap-allocated slice of u64 words, LSB-first within each word.
+// Word count = ceil(num_groups / 64). Supports up to 255 groups (u8 header field).
+type GroupMask = Box<[u64]>;
+
+#[inline]
+fn new_mask(num_groups: usize) -> GroupMask {
+    vec![0u64; num_groups.div_ceil(64)].into_boxed_slice()
+}
+
+#[inline]
+fn mask_set_bit(mask: &mut [u64], group_idx: usize) {
+    mask[group_idx / 64] |= 1u64 << (group_idx % 64);
+}
+
+#[inline]
+fn mask_or_assign(dst: &mut [u64], src: &[u64]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d |= s;
+    }
+}
+
+#[inline]
+fn mask_count_ones(mask: &[u64]) -> u32 {
+    mask.iter().map(|w| w.count_ones()).sum()
+}
+
+#[inline]
+fn mask_has_bit(mask: &[u64], group_idx: usize) -> bool {
+    let word = group_idx / 64;
+    word < mask.len() && (mask[word] >> (group_idx % 64)) & 1 == 1
+}
+// --- end GroupMask helpers ---
+
+/// Classification index mapping k-mers to group bitmasks (up to 255 groups)
 #[derive(Clone)]
 pub enum ClassificationIndex {
     U64(HashMap<u64, u64, FixedRapidHasher>),
