@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use indicatif::ProgressBar;
 use paraseq::Record;
 use paraseq::parallel::{ParallelProcessor, ParallelReader};
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -79,6 +80,15 @@ struct SampleClassificationResult {
 }
 
 // Configuration structs
+
+/// Output mode for classification
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputMode {
+    Summary,
+    PerSeq,
+    GroupCounts,
+}
+
 pub struct BuildConfig {
     pub groups_dir: PathBuf,
     pub kmer_length: u8,
@@ -99,7 +109,7 @@ pub struct ClassifyConfig {
     pub threads: usize,
     pub limit_bp: Option<u64>,
     pub output_path: Option<PathBuf>,
-    pub per_seq: bool,
+    pub output_mode: OutputMode,
     pub discriminatory: bool,
     pub quiet: bool,
 }
@@ -842,6 +852,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifySummaryProcessor {
     }
 }
 
+//TODO: reimplement output counting
 /// Processor for per-sequence classification output mode
 #[derive(Clone)]
 struct ClassifyPerSeqProcessor {
@@ -1020,6 +1031,141 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifyPerSeqProcessor {
     }
 }
 
+/// Processor for group-counts classification mode.
+/// Tallies read counts per classification key using a shared DashMap.
+/// Keys are the group name (classified), "unclassified", or comma-joined group names (ambiguous).
+#[derive(Clone)]
+struct ClassifyGroupCountsProcessor {
+    kmer_length: u8,
+    smer_length: u8,
+    hasher: KmerHasher,
+    index: Arc<ClassificationIndex>,
+    num_groups: usize,
+    group_names: Arc<Vec<String>>,
+    min_hits: u64,
+    min_fraction: f64,
+
+    buffers: Buffers,
+    hits: [u64; 64],
+
+    counts: Arc<DashMap<String, u64>>,
+
+    local_stats: ProcessingStats,
+    global_stats: Arc<Mutex<ProcessingStats>>,
+    spinner: Option<Arc<Mutex<ProgressBar>>>,
+    start_time: Instant,
+    limit_bp: Option<u64>,
+}
+
+impl ClassifyGroupCountsProcessor {
+    fn new(
+        kmer_length: u8,
+        smer_length: u8,
+        index: Arc<ClassificationIndex>,
+        num_groups: usize,
+        group_names: Arc<Vec<String>>,
+        min_hits: u64,
+        min_fraction: f64,
+        counts: Arc<DashMap<String, u64>>,
+        spinner: Option<Arc<Mutex<ProgressBar>>>,
+        start_time: Instant,
+        limit_bp: Option<u64>,
+    ) -> Self {
+        let buffers = if kmer_length <= 32 {
+            Buffers::new_u64()
+        } else {
+            Buffers::new_u128()
+        };
+
+        Self {
+            kmer_length,
+            smer_length,
+            hasher: KmerHasher::new(smer_length as usize),
+            index,
+            num_groups,
+            group_names,
+            min_hits,
+            min_fraction,
+            buffers,
+            hits: [0u64; 64],
+            counts,
+            local_stats: ProcessingStats::default(),
+            global_stats: Arc::new(Mutex::new(ProcessingStats::default())),
+            spinner,
+            start_time,
+            limit_bp,
+        }
+    }
+}
+
+impl<Rf: Record> ParallelProcessor<Rf> for ClassifyGroupCountsProcessor {
+    fn process_record(&mut self, record: Rf) -> paraseq::parallel::Result<()> {
+        if let Some(limit) = self.limit_bp {
+            let global_bp = self.global_stats.lock().total_bp;
+            if global_bp >= limit {
+                return Err(paraseq::parallel::ProcessError::IoError(
+                    sample_limit_reached_io_error(),
+                ));
+            }
+        }
+
+        let seq = record.seq();
+        let seq_len = seq.len();
+        self.local_stats.total_seqs += 1;
+        self.local_stats.total_bp += seq_len as u64;
+
+        let (_total_kmers, classification) = classify_seq_kmers(
+            &seq,
+            &self.hasher,
+            self.kmer_length,
+            self.smer_length,
+            &mut self.buffers,
+            &mut self.hits,
+            self.num_groups,
+            &self.index,
+            self.min_hits,
+            self.min_fraction,
+        );
+
+        let key = match classification {
+            Classification::Classified(group_idx) => self.group_names[group_idx].clone(),
+            Classification::Unclassified => "unclassified".to_string(),
+            Classification::Ambiguous(mask) => {
+                let mut parts = Vec::new();
+                let mut bits = mask;
+                while bits != 0 {
+                    let group_idx = bits.trailing_zeros() as usize;
+                    parts.push(self.group_names[group_idx].as_str());
+                    bits &= bits - 1;
+                }
+                parts.join(",")
+            }
+        };
+        *self.counts.entry(key).or_insert(0) += 1;
+
+        Ok(())
+    }
+
+    fn on_batch_complete(&mut self) -> paraseq::parallel::Result<()> {
+        {
+            let mut stats = self.global_stats.lock();
+            stats.total_seqs += self.local_stats.total_seqs;
+            stats.total_bp += self.local_stats.total_bp;
+
+            let current_progress = stats.total_bp / 100_000_000;
+            if current_progress > stats.last_reported {
+                drop(stats);
+                update_classify_spinner(&self.spinner, &self.global_stats, self.start_time);
+                self.global_stats.lock().last_reported = current_progress;
+            }
+        }
+
+        self.local_stats = ProcessingStats::default();
+
+        Ok(())
+    }
+}
+
 pub fn run_classification(config: &ClassifyConfig) -> Result<()> {
     let start_time = Instant::now();
     let version = env!("CARGO_PKG_VERSION");
@@ -1095,7 +1241,77 @@ pub fn run_classification(config: &ClassifyConfig) -> Result<()> {
     let num_groups = group_names.len();
 
     use rayon::prelude::*;
-    if config.per_seq {
+    if config.output_mode == OutputMode::GroupCounts {
+        let writer: Box<dyn Write> = if let Some(path) = &config.output_path {
+            Box::new(BufWriter::new(File::create(path)?))
+        } else {
+            Box::new(BufWriter::new(io::stdout()))
+        };
+        let mut writer = writer;
+
+        writeln!(writer, "sample\tgroup\tcount")?;
+
+        for (sample_paths, sample_name) in config.sample_paths.iter().zip(&config.sample_names) {
+            let counts: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
+
+            for seq_path in sample_paths {
+                let in_path = if seq_path.to_string_lossy() == "-" {
+                    None
+                } else {
+                    Some(seq_path.as_path())
+                };
+
+                let spinner = create_spinner(config.quiet)?;
+                let pr_start = Instant::now();
+
+                let mut processor = ClassifyGroupCountsProcessor::new(
+                    kmer_length,
+                    smer_length,
+                    Arc::clone(&index),
+                    num_groups,
+                    Arc::clone(&group_names),
+                    config.min_hits,
+                    config.min_fraction,
+                    Arc::clone(&counts),
+                    spinner.clone(),
+                    pr_start,
+                    config.limit_bp,
+                );
+
+                let reader = reader_with_inferred_batch_size(in_path)?;
+                let result = reader.process_parallel(&mut processor, config.threads);
+                handle_process_result(result)?;
+
+                if let Some(ref pb) = spinner {
+                    pb.lock().finish_and_clear();
+                }
+
+                let stats = processor.global_stats.lock().clone();
+                if !config.quiet {
+                    let elapsed = pr_start.elapsed();
+                    let bp_per_sec = stats.total_bp as f64 / elapsed.as_secs_f64();
+                    eprintln!(
+                        "Sample {}: {} seqs ({}) ({})",
+                        sample_name,
+                        stats.total_seqs,
+                        format_bp(stats.total_bp as usize),
+                        format_bp_per_sec(bp_per_sec)
+                    );
+                }
+            }
+
+            let mut rows: Vec<(String, u64)> = counts
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            for (group_key, count) in &rows {
+                writeln!(writer, "{}\t{}\t{}", sample_name, group_key, count)?;
+            }
+        }
+
+        writer.flush()?;
+    } else if config.output_mode == OutputMode::PerSeq {
         let writer: Box<dyn Write + Send> = if let Some(path) = &config.output_path {
             Box::new(BufWriter::new(File::create(path)?))
         } else {
@@ -1162,7 +1378,7 @@ pub fn run_classification(config: &ClassifyConfig) -> Result<()> {
         }
 
         writer.lock().flush()?;
-    } else {
+    } else {  // OutputMode::Summary
         let is_multisample = config.sample_paths.len() > 1;
         let completed = if is_multisample && !config.quiet {
             eprint!(

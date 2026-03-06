@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -114,6 +114,16 @@ fn parse_sample(s: &str) -> Result<u64> {
         .with_context(|| format!("Invalid sample value: {}", s))?;
 
     Ok(num * multiplier)
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum CliOutputMode {
+    /// Summarise read counts per group (default)
+    Summary,
+    /// Output one row per sequence
+    PerSeq,
+    /// Output aggregate read counts per classification key
+    GroupCounts,
 }
 
 #[derive(Parser)]
@@ -269,9 +279,9 @@ enum Commands {
         #[arg(short = 'o', long = "output", default_value = "-")]
         output: String,
 
-        /// Output per-sequence classifications instead of summary
-        #[arg(long = "per-seq", default_value_t = false)]
-        per_seq: bool,
+        /// Output mode: summary (default), per-seq, or group-counts
+        #[arg(long = "output-mode", default_value = "summary")]
+        output_mode: CliOutputMode,
 
         /// Comma-separated sample names (default is file/dir name without extension)
         #[arg(short = 'n', long = "names", value_delimiter = ',')]
@@ -395,7 +405,7 @@ fn main() -> Result<()> {
             threads,
             limit,
             output,
-            per_seq,
+            output_mode,
             quiet,
         } => {
             let (expanded_samples, is_directory) = expand_sample_inputs(samples)?;
@@ -452,7 +462,11 @@ fn main() -> Result<()> {
                 } else {
                     Some(PathBuf::from(output))
                 },
-                per_seq: *per_seq,
+                output_mode: match output_mode {
+                    CliOutputMode::Summary => skope::OutputMode::Summary,
+                    CliOutputMode::PerSeq => skope::OutputMode::PerSeq,
+                    CliOutputMode::GroupCounts => skope::OutputMode::GroupCounts,
+                },
                 discriminatory: *discriminatory,
                 quiet: *quiet,
             };

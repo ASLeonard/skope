@@ -27,7 +27,7 @@ pub use length::{
     run_length_histogram_analysis,
 };
 
-pub use classify::{BuildConfig, ClassifyConfig, build_classification_index, run_classification};
+pub use classify::{BuildConfig, ClassifyConfig, OutputMode, build_classification_index, run_classification};
 
 pub use syncmers::{
     Buffers, DEFAULT_KMER_LENGTH, DEFAULT_SMER_LENGTH, KmerHasher, SyncmerVec, decode_u64,
