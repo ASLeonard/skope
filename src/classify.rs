@@ -58,8 +58,8 @@ fn mask_has_bit(mask: &[u64], group_idx: usize) -> bool {
 /// Classification index mapping k-mers to group bitmasks (up to 255 groups)
 #[derive(Clone)]
 pub enum ClassificationIndex {
-    U64(HashMap<u64, u64, FixedRapidHasher>),
-    U128(HashMap<u128, u64, FixedRapidHasher>),
+    U64(HashMap<u64, GroupMask, FixedRapidHasher>),
+    U128(HashMap<u128, GroupMask, FixedRapidHasher>),
 }
 
 impl ClassificationIndex {
@@ -77,23 +77,23 @@ fn apply_discriminatory_filter(index: &mut ClassificationIndex) -> usize {
     match index {
         ClassificationIndex::U64(map) => {
             let before = map.len();
-            map.retain(|_, bitmask| bitmask.count_ones() == 1);
+            map.retain(|_, bitmask| mask_count_ones(bitmask) == 1);
             before - map.len()
         }
         ClassificationIndex::U128(map) => {
             let before = map.len();
-            map.retain(|_, bitmask| bitmask.count_ones() == 1);
+            map.retain(|_, bitmask| mask_count_ones(bitmask) == 1);
             before - map.len()
         }
     }
 }
 
 // Classification result types
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Classification {
     Unclassified,
     Classified(usize),
-    Ambiguous(u64),
+    Ambiguous(GroupMask),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,15 +155,16 @@ struct GroupKmerProcessor {
     smer_length: u8,
     hasher: KmerHasher,
     buffers: Buffers,
-    group_bit: u64,
+    group_idx: usize,
+    num_groups: usize,
 
     // Thread-local k-mer map
-    local_map_u64: Option<HashMap<u64, u64, FixedRapidHasher>>,
-    local_map_u128: Option<HashMap<u128, u64, FixedRapidHasher>>,
+    local_map_u64: Option<HashMap<u64, GroupMask, FixedRapidHasher>>,
+    local_map_u128: Option<HashMap<u128, GroupMask, FixedRapidHasher>>,
 
     // Shared global state
-    global_map_u64: Arc<Mutex<Option<HashMap<u64, u64, FixedRapidHasher>>>>,
-    global_map_u128: Arc<Mutex<Option<HashMap<u128, u64, FixedRapidHasher>>>>,
+    global_map_u64: Arc<Mutex<Option<HashMap<u64, GroupMask, FixedRapidHasher>>>>,
+    global_map_u128: Arc<Mutex<Option<HashMap<u128, GroupMask, FixedRapidHasher>>>>,
     local_stats: ProcessingStats,
     global_stats: Arc<Mutex<ProcessingStats>>,
 }
@@ -172,9 +173,10 @@ impl GroupKmerProcessor {
     fn new(
         kmer_length: u8,
         smer_length: u8,
-        group_bit: u64,
-        global_map_u64: Arc<Mutex<Option<HashMap<u64, u64, FixedRapidHasher>>>>,
-        global_map_u128: Arc<Mutex<Option<HashMap<u128, u64, FixedRapidHasher>>>>,
+        group_idx: usize,
+        num_groups: usize,
+        global_map_u64: Arc<Mutex<Option<HashMap<u64, GroupMask, FixedRapidHasher>>>>,
+        global_map_u128: Arc<Mutex<Option<HashMap<u128, GroupMask, FixedRapidHasher>>>>,
         global_stats: Arc<Mutex<ProcessingStats>>,
     ) -> Self {
         let buffers = if kmer_length <= 32 {
@@ -194,7 +196,8 @@ impl GroupKmerProcessor {
             smer_length,
             hasher: KmerHasher::new(smer_length as usize),
             buffers,
-            group_bit,
+            group_idx,
+            num_groups,
             local_map_u64,
             local_map_u128,
             global_map_u64,
@@ -220,17 +223,19 @@ impl<Rf: Record> ParallelProcessor<Rf> for GroupKmerProcessor {
             false,
         );
 
+        let group_idx = self.group_idx;
+        let num_groups = self.num_groups;
         match &self.buffers.syncmers {
             SyncmerVec::U64(vec) => {
                 let local = self.local_map_u64.as_mut().unwrap();
                 for &kmer in vec {
-                    *local.entry(kmer).or_insert(0) |= self.group_bit;
+                    mask_set_bit(local.entry(kmer).or_insert_with(|| new_mask(num_groups)), group_idx);
                 }
             }
             SyncmerVec::U128(vec) => {
                 let local = self.local_map_u128.as_mut().unwrap();
                 for &kmer in vec {
-                    *local.entry(kmer).or_insert(0) |= self.group_bit;
+                    mask_set_bit(local.entry(kmer).or_insert_with(|| new_mask(num_groups)), group_idx);
                 }
             }
         }
@@ -239,20 +244,19 @@ impl<Rf: Record> ParallelProcessor<Rf> for GroupKmerProcessor {
     }
 
     fn on_batch_complete(&mut self) -> paraseq::parallel::Result<()> {
+        let num_groups = self.num_groups;
         if let Some(local) = &mut self.local_map_u64 {
             let mut global = self.global_map_u64.lock();
             let global_map = global.as_mut().unwrap();
-            for (&kmer, &bits) in local.iter() {
-                *global_map.entry(kmer).or_insert(0) |= bits;
+            for (kmer, local_mask) in local.drain() {
+                mask_or_assign(global_map.entry(kmer).or_insert_with(|| new_mask(num_groups)), &local_mask);
             }
-            local.clear();
         } else if let Some(local) = &mut self.local_map_u128 {
             let mut global = self.global_map_u128.lock();
             let global_map = global.as_mut().unwrap();
-            for (&kmer, &bits) in local.iter() {
-                *global_map.entry(kmer).or_insert(0) |= bits;
+            for (kmer, local_mask) in local.drain() {
+                mask_or_assign(global_map.entry(kmer).or_insert_with(|| new_mask(num_groups)), &local_mask);
             }
-            local.clear();
         }
 
         {
@@ -278,9 +282,9 @@ fn build_index_in_memory(
 ) -> Result<(ClassificationIndex, Vec<String>)> {
     let group_files = find_fastx_files(groups_dir)?;
 
-    if group_files.len() > 64 {
+    if group_files.len() > u8::MAX as usize {
         return Err(anyhow::anyhow!(
-            "Too many groups: {} (max 64). Each FASTA file in the directory is one group.",
+            "Too many groups: {} (max 255). Each FASTA file in the directory is one group.",
             group_files.len()
         ));
     }
@@ -310,14 +314,16 @@ fn build_index_in_memory(
         );
     }
 
-    let global_map_u64: Arc<Mutex<Option<HashMap<u64, u64, FixedRapidHasher>>>> =
+    let num_groups = group_files.len();
+
+    let global_map_u64: Arc<Mutex<Option<HashMap<u64, GroupMask, FixedRapidHasher>>>> =
         if kmer_length <= 32 {
             Arc::new(Mutex::new(Some(HashMap::with_hasher(FixedRapidHasher))))
         } else {
             Arc::new(Mutex::new(None))
         };
 
-    let global_map_u128: Arc<Mutex<Option<HashMap<u128, u64, FixedRapidHasher>>>> =
+    let global_map_u128: Arc<Mutex<Option<HashMap<u128, GroupMask, FixedRapidHasher>>>> =
         if kmer_length > 32 {
             Arc::new(Mutex::new(Some(HashMap::with_hasher(FixedRapidHasher))))
         } else {
@@ -325,13 +331,13 @@ fn build_index_in_memory(
         };
 
     for (group_idx, (group_file, group_name)) in group_files.iter().zip(&group_names).enumerate() {
-        let group_bit = 1u64 << group_idx;
         let global_stats = Arc::new(Mutex::new(ProcessingStats::default()));
 
         let mut processor = GroupKmerProcessor::new(
             kmer_length,
             smer_length,
-            group_bit,
+            group_idx,
+            num_groups,
             Arc::clone(&global_map_u64),
             Arc::clone(&global_map_u128),
             Arc::clone(&global_stats),
@@ -345,19 +351,19 @@ fn build_index_in_memory(
         let (group_kmers, unique_kmers) = if kmer_length <= 32 {
             let map = global_map_u64.lock();
             let map = map.as_ref().unwrap();
-            let group_kmers = map.values().filter(|&&v| v & group_bit != 0).count();
+            let group_kmers = map.values().filter(|v| mask_has_bit(v, group_idx)).count();
             let unique = map
                 .values()
-                .filter(|&&v| v & group_bit != 0 && v.count_ones() == 1)
+                .filter(|v| mask_has_bit(v, group_idx) && mask_count_ones(v) == 1)
                 .count();
             (group_kmers, unique)
         } else {
             let map = global_map_u128.lock();
             let map = map.as_ref().unwrap();
-            let group_kmers = map.values().filter(|&&v| v & group_bit != 0).count();
+            let group_kmers = map.values().filter(|v| mask_has_bit(v, group_idx)).count();
             let unique = map
                 .values()
-                .filter(|&&v| v & group_bit != 0 && v.count_ones() == 1)
+                .filter(|v| mask_has_bit(v, group_idx) && mask_count_ones(v) == 1)
                 .count();
             (group_kmers, unique)
         };
@@ -391,8 +397,8 @@ fn build_index_in_memory(
 
     if !quiet {
         let shared = match &index {
-            ClassificationIndex::U64(m) => m.values().filter(|v| v.count_ones() > 1).count(),
-            ClassificationIndex::U128(m) => m.values().filter(|v| v.count_ones() > 1).count(),
+            ClassificationIndex::U64(m) => m.values().filter(|v| mask_count_ones(v) > 1).count(),
+            ClassificationIndex::U128(m) => m.values().filter(|v| mask_count_ones(v) > 1).count(),
         };
         eprintln!(
             "Index: {} total syncmers, {} shared across groups",
@@ -473,17 +479,21 @@ fn save_index(
     let kmer_bytes = (kmer_length as usize).div_ceil(4); // ceil(k / 4)
     match index {
         ClassificationIndex::U64(map) => {
-            for (&kmer, &bitmask) in map {
+            for (&kmer, mask) in map {
                 let kmer_le = kmer.to_le_bytes();
                 writer.write_all(&kmer_le[..kmer_bytes])?;
-                writer.write_all(&bitmask.to_le_bytes())?;
+                for &word in mask.iter() {
+                    writer.write_all(&word.to_le_bytes())?;
+                }
             }
         }
         ClassificationIndex::U128(map) => {
-            for (&kmer, &bitmask) in map {
+            for (&kmer, mask) in map {
                 let kmer_le = kmer.to_le_bytes();
                 writer.write_all(&kmer_le[..kmer_bytes])?;
-                writer.write_all(&bitmask.to_le_bytes())?;
+                for &word in mask.iter() {
+                    writer.write_all(&word.to_le_bytes())?;
+                }
             }
         }
     }
@@ -532,7 +542,8 @@ pub fn load_index(path: &Path) -> Result<(ClassificationIndex, Vec<String>, u8, 
         .with_context(|| format!("Entry count is too large for this platform: {count_u64}"))?;
 
     let kmer_bytes = (kmer_length as usize).div_ceil(4);
-    let entry_size = kmer_bytes + 8; // k-mer bytes + group bitmask
+    let mask_words = (num_groups as usize).div_ceil(64);
+    let entry_size = kmer_bytes + mask_words * 8; // k-mer bytes + bitmask words
 
     let raw_data = &file_bytes[cursor.position()..];
 
@@ -546,7 +557,7 @@ pub fn load_index(path: &Path) -> Result<(ClassificationIndex, Vec<String>, u8, 
     }
 
     let index = if kmer_length <= 32 {
-        let mut map: HashMap<u64, u64, FixedRapidHasher> =
+        let mut map: HashMap<u64, GroupMask, FixedRapidHasher> =
             HashMap::with_capacity_and_hasher(count, FixedRapidHasher);
         for i in 0..count {
             let offset = i * entry_size;
@@ -554,18 +565,16 @@ pub fn load_index(path: &Path) -> Result<(ClassificationIndex, Vec<String>, u8, 
             kmer_buf[..kmer_bytes].copy_from_slice(&raw_data[offset..offset + kmer_bytes]);
             let kmer = u64::from_le_bytes(kmer_buf);
 
-            let bitmask_offset = offset + kmer_bytes;
-            let bitmask = u64::from_le_bytes(
-                raw_data[bitmask_offset..bitmask_offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-
-            map.insert(kmer, bitmask);
+            let mut mask = new_mask(num_groups as usize);
+            for (w, word) in mask.iter_mut().enumerate() {
+                let wo = offset + kmer_bytes + w * 8;
+                *word = u64::from_le_bytes(raw_data[wo..wo + 8].try_into().unwrap());
+            }
+            map.insert(kmer, mask);
         }
         ClassificationIndex::U64(map)
     } else {
-        let mut map: HashMap<u128, u64, FixedRapidHasher> =
+        let mut map: HashMap<u128, GroupMask, FixedRapidHasher> =
             HashMap::with_capacity_and_hasher(count, FixedRapidHasher);
         for i in 0..count {
             let offset = i * entry_size;
@@ -573,14 +582,12 @@ pub fn load_index(path: &Path) -> Result<(ClassificationIndex, Vec<String>, u8, 
             kmer_buf[..kmer_bytes].copy_from_slice(&raw_data[offset..offset + kmer_bytes]);
             let kmer = u128::from_le_bytes(kmer_buf);
 
-            let bitmask_offset = offset + kmer_bytes;
-            let bitmask = u64::from_le_bytes(
-                raw_data[bitmask_offset..bitmask_offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-
-            map.insert(kmer, bitmask);
+            let mut mask = new_mask(num_groups as usize);
+            for (w, word) in mask.iter_mut().enumerate() {
+                let wo = offset + kmer_bytes + w * 8;
+                *word = u64::from_le_bytes(raw_data[wo..wo + 8].try_into().unwrap());
+            }
+            map.insert(kmer, mask);
         }
         ClassificationIndex::U128(map)
     };
@@ -588,9 +595,9 @@ pub fn load_index(path: &Path) -> Result<(ClassificationIndex, Vec<String>, u8, 
     Ok((index, group_names, kmer_length, smer_length))
 }
 
-/// Classify one sequecne using per-group hit counts
+/// Classify one sequence using per-group hit counts
 fn classify_seq(
-    hits: &mut [u64; 64],
+    hits: &[u64],
     num_groups: usize,
     total_kmers: usize,
     min_hits: u64,
@@ -600,13 +607,13 @@ fn classify_seq(
         return Classification::Unclassified;
     }
 
-    let mut matching_mask = 0u64;
+    let mut matching_mask = new_mask(num_groups);
     let mut match_count = 0u32;
     let mut single_match = 0usize;
 
     for (group_idx, &group_hits) in hits[..num_groups].iter().enumerate() {
         if group_hits >= min_hits && (group_hits as f64 / total_kmers as f64) >= min_fraction {
-            matching_mask |= 1u64 << group_idx;
+            mask_set_bit(&mut matching_mask, group_idx);
             match_count += 1;
             single_match = group_idx;
         }
@@ -648,7 +655,7 @@ fn classify_seq_kmers(
     kmer_length: u8,
     smer_length: u8,
     buffers: &mut Buffers,
-    hits: &mut [u64; 64],
+    hits: &mut [u64],
     num_groups: usize,
     index: &ClassificationIndex,
     min_hits: u64,
@@ -665,24 +672,28 @@ fn classify_seq_kmers(
     match (&buffers.syncmers, index) {
         (SyncmerVec::U64(vec), ClassificationIndex::U64(map)) => {
             for &kmer in vec {
-                if let Some(&bitmask) = map.get(&kmer) {
-                    let mut bits = bitmask;
-                    while bits != 0 {
-                        let group_idx = bits.trailing_zeros() as usize;
-                        hits[group_idx] += 1;
-                        bits &= bits - 1;
+                if let Some(mask) = map.get(&kmer) {
+                    for (word_idx, &word) in mask.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            hits[word_idx * 64 + bit] += 1;
+                            bits &= bits - 1;
+                        }
                     }
                 }
             }
         }
         (SyncmerVec::U128(vec), ClassificationIndex::U128(map)) => {
             for &kmer in vec {
-                if let Some(&bitmask) = map.get(&kmer) {
-                    let mut bits = bitmask;
-                    while bits != 0 {
-                        let group_idx = bits.trailing_zeros() as usize;
-                        hits[group_idx] += 1;
-                        bits &= bits - 1;
+                if let Some(mask) = map.get(&kmer) {
+                    for (word_idx, &word) in mask.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            hits[word_idx * 64 + bit] += 1;
+                            bits &= bits - 1;
+                        }
                     }
                 }
             }
@@ -733,7 +744,7 @@ struct ClassifySummaryProcessor {
     min_fraction: f64,
 
     buffers: Buffers,
-    hits: [u64; 64],
+    hits: Vec<u64>,
 
     local_group_seqs: Vec<u64>,
     local_group_bases: Vec<u64>,
@@ -776,7 +787,7 @@ impl ClassifySummaryProcessor {
             min_hits,
             min_fraction,
             buffers,
-            hits: [0u64; 64],
+            hits: vec![0u64; num_groups],
             local_group_seqs: vec![0; num_groups],
             local_group_bases: vec![0; num_groups],
             local_ambiguous_seqs: 0,
@@ -826,7 +837,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifySummaryProcessor {
                 self.local_group_seqs[group_idx] += 1;
                 self.local_group_bases[group_idx] += seq_len as u64;
             }
-            Classification::Ambiguous(_) => {
+            Classification::Ambiguous(_mask) => {
                 self.local_ambiguous_seqs += 1;
                 self.local_ambiguous_bases += seq_len as u64;
             }
@@ -901,7 +912,7 @@ struct ClassifyPerSeqProcessor {
     sample_name: String,
 
     buffers: Buffers,
-    hits: [u64; 64],
+    hits: Vec<u64>,
 
     local_output: Vec<u8>,
     output_writer: Arc<Mutex<BufWriter<Box<dyn Write + Send>>>>,
@@ -945,7 +956,7 @@ impl ClassifyPerSeqProcessor {
             min_fraction,
             sample_name,
             buffers,
-            hits: [0u64; 64],
+            hits: vec![0u64; num_groups],
             local_output: Vec::with_capacity(64 * 1024),
             output_writer,
             local_stats: ProcessingStats::default(),
@@ -1012,18 +1023,21 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifyPerSeqProcessor {
             Classification::Ambiguous(mask) => {
                 let mut groups = String::new();
                 let mut hits_str = String::new();
-                let mut bits = mask;
                 let mut first = true;
-                while bits != 0 {
-                    let group_idx = bits.trailing_zeros() as usize;
-                    if !first {
-                        groups.push(',');
-                        hits_str.push(',');
+                for (word_idx, &word) in mask.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        let group_idx = word_idx * 64 + bit;
+                        if !first {
+                            groups.push(',');
+                            hits_str.push(',');
+                        }
+                        groups.push_str(&self.group_names[group_idx]);
+                        let _ = write!(hits_str, "{}", self.hits[group_idx]);
+                        first = false;
+                        bits &= bits - 1;
                     }
-                    groups.push_str(&self.group_names[group_idx]);
-                    let _ = write!(hits_str, "{}", self.hits[group_idx]);
-                    first = false;
-                    bits &= bits - 1;
                 }
 
                 let _ = writeln!(
@@ -1080,7 +1094,7 @@ struct ClassifyGroupCountsProcessor {
     min_fraction: f64,
 
     buffers: Buffers,
-    hits: [u64; 64],
+    hits: Vec<u64>,
 
     counts: Arc<DashMap<String, u64>>,
 
@@ -1121,7 +1135,7 @@ impl ClassifyGroupCountsProcessor {
             min_hits,
             min_fraction,
             buffers,
-            hits: [0u64; 64],
+            hits: vec![0u64; num_groups],
             counts,
             local_stats: ProcessingStats::default(),
             global_stats: Arc::new(Mutex::new(ProcessingStats::default())),
@@ -1166,11 +1180,14 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifyGroupCountsProcessor {
             Classification::Unclassified => "unclassified".to_string(),
             Classification::Ambiguous(mask) => {
                 let mut parts = Vec::new();
-                let mut bits = mask;
-                while bits != 0 {
-                    let group_idx = bits.trailing_zeros() as usize;
-                    parts.push(self.group_names[group_idx].as_str());
-                    bits &= bits - 1;
+                for (word_idx, &word) in mask.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        let group_idx = word_idx * 64 + bit;
+                        parts.push(self.group_names[group_idx].as_str());
+                        bits &= bits - 1;
+                    }
                 }
                 parts.join(",")
             }
