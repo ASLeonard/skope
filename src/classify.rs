@@ -91,6 +91,7 @@ fn apply_discriminatory_filter(index: &mut ClassificationIndex) -> usize {
 // Classification result types
 #[derive(Debug, Clone)]
 enum Classification {
+    Uninformative,
     Unclassified,
     Classified(usize),
     Ambiguous(GroupMask),
@@ -109,6 +110,8 @@ struct SampleClassificationResult {
     ambiguous_bases: u64,
     unclassified_seqs: u64,
     unclassified_bases: u64,
+    uninformative_seqs: u64,
+    uninformative_bases: u64,
     total_seqs: u64,
     total_bases: u64,
 }
@@ -604,7 +607,7 @@ fn classify_seq(
     min_fraction: f64,
 ) -> Classification {
     if total_kmers == 0 {
-        return Classification::Unclassified;
+        return Classification::Uninformative;
     }
 
     let mut matching_mask = new_mask(num_groups);
@@ -715,6 +718,8 @@ struct GlobalClassifyState {
     ambiguous_bases: u64,
     unclassified_seqs: u64,
     unclassified_bases: u64,
+    uninformative_seqs: u64,
+    uninformative_bases: u64,
     stats: ProcessingStats,
 }
 
@@ -727,6 +732,8 @@ impl GlobalClassifyState {
             ambiguous_bases: 0,
             unclassified_seqs: 0,
             unclassified_bases: 0,
+            uninformative_seqs: 0,
+            uninformative_bases: 0,
             stats: ProcessingStats::default(),
         }
     }
@@ -752,6 +759,8 @@ struct ClassifySummaryProcessor {
     local_ambiguous_bases: u64,
     local_unclassified_seqs: u64,
     local_unclassified_bases: u64,
+    local_uninformative_seqs: u64,
+    local_uninformative_bases: u64,
     local_stats: ProcessingStats,
 
     global: Arc<Mutex<GlobalClassifyState>>,
@@ -794,6 +803,8 @@ impl ClassifySummaryProcessor {
             local_ambiguous_bases: 0,
             local_unclassified_seqs: 0,
             local_unclassified_bases: 0,
+            local_uninformative_seqs: 0,
+            local_uninformative_bases: 0,
             local_stats: ProcessingStats::default(),
             global: Arc::new(Mutex::new(GlobalClassifyState::new(num_groups))),
             spinner,
@@ -845,6 +856,10 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifySummaryProcessor {
                 self.local_unclassified_seqs += 1;
                 self.local_unclassified_bases += seq_len as u64;
             }
+            Classification::Uninformative => {
+                self.local_uninformative_seqs += 1;
+                self.local_uninformative_bases += seq_len as u64;
+            }
         }
 
         Ok(())
@@ -864,10 +879,14 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifySummaryProcessor {
         g.ambiguous_bases += self.local_ambiguous_bases;
         g.unclassified_seqs += self.local_unclassified_seqs;
         g.unclassified_bases += self.local_unclassified_bases;
+        g.uninformative_seqs += self.local_uninformative_seqs;
+        g.uninformative_bases += self.local_uninformative_bases;
         self.local_ambiguous_seqs = 0;
         self.local_ambiguous_bases = 0;
         self.local_unclassified_seqs = 0;
         self.local_unclassified_bases = 0;
+        self.local_uninformative_seqs = 0;
+        self.local_uninformative_bases = 0;
 
         g.stats.total_seqs += self.local_stats.total_seqs;
         g.stats.total_bp += self.local_stats.total_bp;
@@ -1017,6 +1036,13 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifyPerSeqProcessor {
                 let _ = writeln!(
                     self.local_output,
                     "{}\t{}\tunclassified\t.\t0\t{}\t{}",
+                    self.sample_name, seq_id, total_kmers, seq_len,
+                );
+            }
+            Classification::Uninformative => {
+                let _ = writeln!(
+                    self.local_output,
+                    "{}\t{}\tuninformative\t.\t0\t{}\t{}",
                     self.sample_name, seq_id, total_kmers, seq_len,
                 );
             }
@@ -1178,6 +1204,7 @@ impl<Rf: Record> ParallelProcessor<Rf> for ClassifyGroupCountsProcessor {
         let key = match classification {
             Classification::Classified(group_idx) => self.group_names[group_idx].clone(),
             Classification::Unclassified => "unclassified".to_string(),
+            Classification::Uninformative => "uninformative".to_string(),
             Classification::Ambiguous(mask) => {
                 let mut parts = Vec::new();
                 for (word_idx, &word) in mask.iter().enumerate() {
@@ -1555,6 +1582,26 @@ pub fn run_classification(config: &ClassifyConfig) -> Result<()> {
                 ));
             }
 
+            {
+                let pct_seqs = if total_seqs > 0.0 {
+                    result.uninformative_seqs as f64 / total_seqs * 100.0
+                } else {
+                    0.0
+                };
+                let pct_bases = if total_bases > 0.0 {
+                    result.uninformative_bases as f64 / total_bases * 100.0
+                } else {
+                    0.0
+                };
+                rows.push((
+                    "uninformative",
+                    result.uninformative_seqs,
+                    pct_seqs,
+                    result.uninformative_bases,
+                    pct_bases,
+                ));
+            }
+
             rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
             for (group_name, seqs, pct_seqs, bases, pct_bases) in &rows {
@@ -1637,6 +1684,8 @@ fn process_sample_summary(
         combined.ambiguous_bases += g.ambiguous_bases;
         combined.unclassified_seqs += g.unclassified_seqs;
         combined.unclassified_bases += g.unclassified_bases;
+        combined.uninformative_seqs += g.uninformative_seqs;
+        combined.uninformative_bases += g.uninformative_bases;
 
         combined.total_seqs += g.stats.total_seqs;
         combined.total_bases += g.stats.total_bp;

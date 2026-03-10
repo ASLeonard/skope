@@ -25,6 +25,7 @@ fn test_multisample_processing() {
         sort_order: SortOrder::Original,
         dump_positions_path: None,
         no_total: false,
+        disjoint: false,
     };
 
     assert!(skope::run_containment_analysis(&config).is_ok());
@@ -53,8 +54,7 @@ fn test_multisample_report_structure() {
         limit_bp: None,
         sort_order: SortOrder::Original,
         dump_positions_path: None,
-        no_total: false,
-    };
+        no_total: false,        disjoint: false,    };
 
     skope::run_containment_analysis(&config).unwrap();
 
@@ -106,6 +106,7 @@ fn test_sort_target() {
         sort_order: SortOrder::Target,
         dump_positions_path: None,
         no_total: false,
+        disjoint: false,
     };
 
     skope::run_containment_analysis(&config).unwrap();
@@ -150,6 +151,7 @@ fn test_sort_containment() {
         sort_order: SortOrder::Containment,
         dump_positions_path: None,
         no_total: false,
+        disjoint: false,
     };
 
     skope::run_containment_analysis(&config).unwrap();
